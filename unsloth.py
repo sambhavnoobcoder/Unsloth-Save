@@ -479,6 +479,13 @@ def log_memory_stats():
     except Exception as e:
         print(f"Error collecting memory stats: {str(e)}")
 
+def monitor_compilations():
+    compilation_count = torch._dynamo.utils.compile_times().__len__()
+    print(f"Total compilations: {compilation_count}")
+    if compilation_count > 30:
+        print("Warning: Excessive recompilations detected!")
+    return compilation_count
+
 # ------------
 # Main Script
 # ------------
@@ -550,6 +557,9 @@ if __name__ == "__main__":
     log_memory_stats()
 
     print("\nTraining completed!")
+
+    # Add to your training loop
+    compilation_count = monitor_compilations()
 
 @torch.compile(**torch_compile_options)
 def compiled_loss(logits, labels):
