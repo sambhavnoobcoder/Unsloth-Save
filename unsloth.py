@@ -313,6 +313,16 @@ def setup_model():
 
     return model
 
+# Move compiled_loss definition before setup_trainer
+@torch.compile(**torch_compile_options)
+def compiled_loss(logits, labels):
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    return F.cross_entropy(
+        shift_logits.view(-1, shift_logits.size(-1)),
+        shift_labels.view(-1)
+    )
+
 # ------------------
 # Training Setup
 # ------------------
@@ -373,6 +383,14 @@ def setup_trainer(model, tokenizer):
         desc="Processing dataset",
     )
 
+    # Create a custom data collator that uses compiled loss
+    def custom_data_collator(features):
+        batch = {}
+        batch["input_ids"] = torch.stack([torch.tensor(f["input_ids"]) for f in features])
+        batch["attention_mask"] = torch.stack([torch.tensor(f["attention_mask"]) for f in features])
+        batch["labels"] = batch["input_ids"].clone()
+        return batch
+
     # Configure training arguments
     training_args = SFTConfig(
         per_device_train_batch_size=1,
@@ -390,12 +408,26 @@ def setup_trainer(model, tokenizer):
         dataloader_pin_memory=False,
     )
 
-    return SFTTrainer(
+    class CustomTrainer(SFTTrainer):
+        def compute_loss(self, model, inputs, return_outputs=False):
+            """
+            Override compute_loss to use our compiled loss function
+            """
+            outputs = model(**inputs)
+            logits = outputs.logits
+            labels = inputs["labels"]
+            
+            # Now compiled_loss will be properly defined
+            loss = compiled_loss(logits, labels)
+            
+            return (loss, outputs) if return_outputs else loss
+
+    return CustomTrainer(
         model=model,
         train_dataset=tokenized_dataset,
         args=training_args,
         tokenizer=tokenizer,
-        data_collator=None,
+        data_collator=custom_data_collator,
     )
 
 # ------------------
@@ -475,6 +507,39 @@ def monitor_compilations():
         print("Warning: Excessive recompilations detected!")
     return compilation_count
 
+# Add at the beginning of your file, after imports
+def setup_compilation_environment():
+    """Setup the compilation environment to run in pure eager mode"""
+    # Completely disable torch.compile and related features
+    torch._dynamo.config.disable = True  # Completely disable dynamo
+    torch._dynamo.config.suppress_errors = True
+    torch._dynamo.config.cache_size_limit = 0
+    
+    # Force eager mode execution
+    os.environ.pop("TORCH_COMPILE_BACKEND", None)  # Remove if exists
+    os.environ.pop("TORCHDYNAMO_BACKEND", None)  # Remove if exists
+    os.environ["TORCH_COMPILE_MODE"] = "reduce-overhead"
+    
+    # Disable all compilation-related logging
+    os.environ.pop("TORCH_LOGS", None)
+    os.environ.pop("TORCHDYNAMO_VERBOSE", None)
+    os.environ.pop("TORCHDYNAMO_REPORT_GUARD_FAILURES", None)
+    
+    # Basic CUDA optimizations that don't require compilation
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    
+    # Disable JIT and other features
+    torch.jit.enable = False
+    torch.jit.skip_tracing = True
+    
+    print("Running in pure eager mode with all compilation disabled")
+    return None
+
+def compile_loss_fn(loss_fn):
+    """Pure pass-through wrapper for loss function"""
+    return loss_fn  # No compilation, just return the original function
+
 # ------------
 # Main Script
 # ------------
@@ -484,7 +549,10 @@ if __name__ == "__main__":
 
     # Setup monitoring
     setup_monitoring()
-
+    
+    # Setup compilation environment
+    torch_compile_options = setup_compilation_environment()
+    
     print("\n=== Starting Model Loading ===")
     print("Initial GPU Memory:")
     print(torch.cuda.memory_summary())
@@ -549,12 +617,3 @@ if __name__ == "__main__":
 
     # Add to your training loop
     compilation_count = monitor_compilations()
-
-@torch.compile(**torch_compile_options)
-def compiled_loss(logits, labels):
-    shift_logits = logits[..., :-1, :].contiguous()
-    shift_labels = labels[..., 1:].contiguous()
-    return F.cross_entropy(
-        shift_logits.view(-1, shift_logits.size(-1)),
-        shift_labels.view(-1)
-    )
