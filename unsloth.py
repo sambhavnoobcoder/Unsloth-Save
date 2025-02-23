@@ -30,32 +30,21 @@ os.environ["TORCH_DYNAMO_EXPORT_AOT_GRAPH"] = "1"  # Export AOT graphs for debug
 # BnB 4-bit Patching
 # ---------------------
 def dequant_4bit_patched(weight, quant_state):
-    """
-    Patched dequantization function that properly handles QuantState objects
-    """
+    """Enhanced 4-bit dequantization with proper shape handling"""
     if hasattr(quant_state, 'scales'):
-        # New bitsandbytes version with QuantState object
         scales = quant_state.scales
         zeros = quant_state.zeros if hasattr(quant_state, 'zeros') else None
         g_idx = quant_state.g_idx if hasattr(quant_state, 'g_idx') else None
-
-        # Get original weight shape
+        
         original_shape = weight.shape
-
-        # Handle 4-bit quantization
         if weight.dtype == torch.uint8:
-            # Reshape weight to match expected dimensions
             weight = weight.reshape(-1, weight.shape[-1])
-            weight_deq = dequantize_4bit(weight, scales, zeros, g_idx)
-            # Restore original shape
+            weight_deq = bnb.functional.dequantize_4bit(weight, scales, zeros, g_idx)
             weight_deq = weight_deq.reshape(original_shape)
         else:
             weight_deq = weight
-
         return weight_deq
-    else:
-        # Fallback for older versions or different quantization schemes
-        return weight
+    return weight
 
 def create_model_and_transforms():
     # ... existing code ...
