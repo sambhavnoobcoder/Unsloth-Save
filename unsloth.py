@@ -11,6 +11,8 @@ import logging
 import math
 import types
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 # ----------------------
 # Critical Configuration
@@ -313,15 +315,89 @@ def setup_model():
 
     return model
 
-# Move compiled_loss definition before setup_trainer
-@torch.compile(**torch_compile_options)
-def compiled_loss(logits, labels):
-    shift_logits = logits[..., :-1, :].contiguous()
-    shift_labels = labels[..., 1:].contiguous()
-    return F.cross_entropy(
-        shift_logits.view(-1, shift_logits.size(-1)),
-        shift_labels.view(-1)
-    )
+# First, let's create a more efficient loss implementation
+@triton.jit
+def cross_entropy_kernel(
+    logits_ptr, labels_ptr, output_ptr,
+    stride, n_classes,
+    BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    
+    # Load logits and labels
+    mask = offsets < stride
+    logits = tl.load(logits_ptr + offsets * n_classes, mask=mask)
+    labels = tl.load(labels_ptr + offsets, mask=mask)
+    
+    # Compute cross entropy
+    log_probs = tl.log_softmax(logits)
+    loss = -log_probs[labels]
+    
+    # Store result
+    tl.store(output_ptr + offsets, loss, mask=mask)
+
+def setup_compilation_environment():
+    """Setup optimized compilation environment"""
+    # Enable basic compilation optimizations
+    torch._dynamo.config.suppress_errors = True
+    torch._dynamo.config.cache_size_limit = 16384
+    
+    # Enable cuBLAS for matrix operations
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    
+    # Enable compiler optimizations
+    os.environ["TORCH_COMPILE_MODE"] = "max-autotune"
+    
+    # Set compilation debug flags
+    os.environ["TORCH_COMPILE_DEBUG"] = "1"
+    os.environ["TORCHDYNAMO_VERBOSE"] = "1"
+    
+    print("Running with optimized compilation settings")
+    return "inductor"
+
+class CustomTrainer(SFTTrainer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Compile the compute_loss method instead of just the loss function
+        self.compute_loss = torch.compile(
+            self.compute_loss,
+            backend="inductor",
+            mode="max-autotune",
+            fullgraph=True
+        )
+    
+    def compute_loss(self, model, inputs, return_outputs=False):
+        """Optimized loss computation"""
+        labels = inputs.pop("labels")
+        outputs = model(**inputs)
+        logits = outputs.logits
+        
+        # Prepare tensors
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        
+        # Reshape for efficient computation
+        vocab_size = shift_logits.size(-1)
+        flat_logits = shift_logits.view(-1, vocab_size)
+        flat_labels = shift_labels.view(-1)
+        
+        # Filter out padding tokens
+        mask = flat_labels != -100
+        valid_logits = flat_logits[mask]
+        valid_labels = flat_labels[mask]
+        
+        # Compute loss
+        loss = F.cross_entropy(
+            valid_logits,
+            valid_labels,
+            ignore_index=-100,
+            reduction='mean'
+        )
+        
+        return (loss, outputs) if return_outputs else loss
 
 # ------------------
 # Training Setup
@@ -408,20 +484,6 @@ def setup_trainer(model, tokenizer):
         dataloader_pin_memory=False,
     )
 
-    class CustomTrainer(SFTTrainer):
-        def compute_loss(self, model, inputs, return_outputs=False):
-            """
-            Override compute_loss to use our compiled loss function
-            """
-            outputs = model(**inputs)
-            logits = outputs.logits
-            labels = inputs["labels"]
-            
-            # Now compiled_loss will be properly defined
-            loss = compiled_loss(logits, labels)
-            
-            return (loss, outputs) if return_outputs else loss
-
     return CustomTrainer(
         model=model,
         train_dataset=tokenized_dataset,
@@ -506,39 +568,6 @@ def monitor_compilations():
     if compilation_count > 30:
         print("Warning: Excessive recompilations detected!")
     return compilation_count
-
-# Add at the beginning of your file, after imports
-def setup_compilation_environment():
-    """Setup the compilation environment to run in pure eager mode"""
-    # Completely disable torch.compile and related features
-    torch._dynamo.config.disable = True  # Completely disable dynamo
-    torch._dynamo.config.suppress_errors = True
-    torch._dynamo.config.cache_size_limit = 0
-    
-    # Force eager mode execution
-    os.environ.pop("TORCH_COMPILE_BACKEND", None)  # Remove if exists
-    os.environ.pop("TORCHDYNAMO_BACKEND", None)  # Remove if exists
-    os.environ["TORCH_COMPILE_MODE"] = "reduce-overhead"
-    
-    # Disable all compilation-related logging
-    os.environ.pop("TORCH_LOGS", None)
-    os.environ.pop("TORCHDYNAMO_VERBOSE", None)
-    os.environ.pop("TORCHDYNAMO_REPORT_GUARD_FAILURES", None)
-    
-    # Basic CUDA optimizations that don't require compilation
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
-    
-    # Disable JIT and other features
-    torch.jit.enable = False
-    torch.jit.skip_tracing = True
-    
-    print("Running in pure eager mode with all compilation disabled")
-    return None
-
-def compile_loss_fn(loss_fn):
-    """Pure pass-through wrapper for loss function"""
-    return loss_fn  # No compilation, just return the original function
 
 # ------------
 # Main Script
