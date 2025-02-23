@@ -235,6 +235,12 @@ def compiled_attention_forward(hidden_states, attention_mask=None, position_ids=
 
     return (attn_output, past_key_value, attn_weights) if output_attentions else (attn_output, past_key_value)
 
+@torch.compile(**torch_compile_options)
+def compiled_layernorm(hidden_states, weight, variance_epsilon=1e-6):
+    variance = hidden_states.pow(2).mean(-1, keepdim=True)
+    hidden_states = hidden_states * torch.rsqrt(variance + variance_epsilon)
+    return weight * hidden_states
+
 # ----------------------
 # Model Patching
 # ----------------------
@@ -258,6 +264,15 @@ def patch_model_for_compile(model):
             module.forward = create_attention_forward(module)
             # Store original forward for reference
             module._original_forward = module.__class__.forward
+
+    # Add LayerNorm patching
+    for module in model.modules():
+        if isinstance(module, LlamaRMSNorm):
+            def create_forward(mod):
+                def forward(x):
+                    return compiled_layernorm(x, mod.weight, mod.variance_epsilon)
+                return forward
+            module.forward = create_forward(module)
 
     return model
 
