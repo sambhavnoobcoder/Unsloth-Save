@@ -339,62 +339,134 @@ def cross_entropy_kernel(
     tl.store(output_ptr + offsets, loss, mask=mask)
 
 def setup_compilation_environment():
-    """Setup optimized compilation environment"""
-    # Enable basic compilation optimizations
+    """Setup compilation environment for maximum static optimization"""
+    # Force static shapes
     torch._dynamo.config.suppress_errors = True
-    torch._dynamo.config.cache_size_limit = 16384
+    torch._dynamo.config.dynamic_shapes = False
+    torch._dynamo.config.assume_static_by_default = True
+    torch._dynamo.config.cache_size_limit = 131072  # 128K cache
     
-    # Enable cuBLAS for matrix operations
+    # Disable dynamic features
+    os.environ["TORCH_COMPILE_MODE"] = "max-autotune"
+    os.environ["TORCHDYNAMO_DYNAMIC_SHAPES"] = "0"
+    os.environ["TORCHDYNAMO_GUARD_NN_MODULES"] = "0"
+    os.environ["TORCH_LOGS"] = "dynamic"
+    
+    # Enable CUDA optimizations
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
     
-    # Enable compiler optimizations
-    os.environ["TORCH_COMPILE_MODE"] = "max-autotune"
-    
-    # Set compilation debug flags
-    os.environ["TORCH_COMPILE_DEBUG"] = "1"
-    os.environ["TORCHDYNAMO_VERBOSE"] = "1"
-    
-    print("Running with optimized compilation settings")
+    print("Running with strict static shape optimization")
     return "inductor"
 
 class CustomTrainer(SFTTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Compile the compute_loss method instead of just the loss function
-        self.compute_loss = torch.compile(
-            self.compute_loss,
-            backend="inductor",
-            mode="max-autotune",
-            fullgraph=True
-        )
+        
+        # Cache static shapes and configs
+        self._setup_static_config(kwargs.get('model'))
+        
+        # Pre-compile with static shapes
+        self._setup_static_functions()
+    
+    def _setup_static_config(self, model):
+        """Setup static configuration to prevent recompilations"""
+        self._static_config = {
+            'batch_size': 1,
+            'seq_length': 2048,
+            'hidden_size': model.config.hidden_size,
+            'vocab_size': model.config.vocab_size,
+            'dtype': torch.float16
+        }
+        
+        # Create static buffers
+        device = torch.device('cuda')
+        self._static_buffers = {
+            'input_ids': torch.zeros(
+                (self._static_config['batch_size'], self._static_config['seq_length']),
+                dtype=torch.long, device=device
+            ),
+            'attention_mask': torch.ones(
+                (self._static_config['batch_size'], self._static_config['seq_length']),
+                dtype=torch.long, device=device
+            ),
+            'labels': torch.zeros(
+                (self._static_config['batch_size'], self._static_config['seq_length']),
+                dtype=torch.long, device=device
+            )
+        }
+    
+    def _setup_static_functions(self):
+        """Setup all compiled functions with strict static shapes"""
+        
+        def static_forward(model, input_ids, attention_mask):
+            """Forward pass with guaranteed static shapes"""
+            return model(
+                input_ids=input_ids[:, :self._static_config['seq_length']],
+                attention_mask=attention_mask[:, :self._static_config['seq_length']],
+                use_cache=False
+            )
+        
+        def static_loss(logits, labels):
+            """Loss computation with guaranteed static shapes"""
+            # Use static shapes
+            batch_size = self._static_config['batch_size']
+            seq_length = self._static_config['seq_length']
+            vocab_size = self._static_config['vocab_size']
+            
+            # Reshape with known static dimensions
+            flat_logits = logits.view(-1, vocab_size)
+            flat_labels = labels.view(-1)
+            
+            # Static masking
+            mask = (flat_labels != -100)
+            valid_logits = flat_logits[mask]
+            valid_labels = flat_labels[mask]
+            
+            return F.cross_entropy(
+                valid_logits,
+                valid_labels,
+                ignore_index=-100,
+                reduction='mean'
+            )
+        
+        # Compile with strict static shapes
+        self._compiled_fns = {
+            'forward': torch.compile(
+                static_forward,
+                backend="inductor",
+                mode="max-autotune",
+                fullgraph=True,
+                dynamic=False
+            ),
+            'loss': torch.compile(
+                static_loss,
+                backend="inductor",
+                mode="max-autotune",
+                fullgraph=True,
+                dynamic=False
+            )
+        }
     
     def compute_loss(self, model, inputs, return_outputs=False):
-        """Optimized loss computation"""
-        labels = inputs.pop("labels")
-        outputs = model(**inputs)
-        logits = outputs.logits
+        """Compute loss with static shapes"""
+        # Copy inputs to static buffers to maintain shapes
+        for key in ['input_ids', 'attention_mask', 'labels']:
+            if key in inputs:
+                self._static_buffers[key].copy_(inputs[key])
         
-        # Prepare tensors
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
+        # Forward pass with static shapes
+        outputs = self._compiled_fns['forward'](
+            model,
+            self._static_buffers['input_ids'],
+            self._static_buffers['attention_mask']
+        )
         
-        # Reshape for efficient computation
-        vocab_size = shift_logits.size(-1)
-        flat_logits = shift_logits.view(-1, vocab_size)
-        flat_labels = shift_labels.view(-1)
-        
-        # Filter out padding tokens
-        mask = flat_labels != -100
-        valid_logits = flat_logits[mask]
-        valid_labels = flat_labels[mask]
-        
-        # Compute loss
-        loss = F.cross_entropy(
-            valid_logits,
-            valid_labels,
-            ignore_index=-100,
-            reduction='mean'
+        # Compute loss with static shapes
+        loss = self._compiled_fns['loss'](
+            outputs.logits,
+            self._static_buffers['labels']
         )
         
         return (loss, outputs) if return_outputs else loss
