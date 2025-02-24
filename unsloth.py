@@ -345,7 +345,7 @@ def setup_compilation_environment():
     torch._dynamo.config.suppress_errors = True
     torch._dynamo.config.dynamic_shapes = False
     torch._dynamo.config.assume_static_by_default = True
-    torch._dynamo.config.cache_size_limit = 131072  # 128K cache
+    torch._dynamo.config.cache_size_limit = 262144  # Increase from 131072 to reduce recompilations
     
     # Disable dynamic features
     os.environ["TORCH_COMPILE_MODE"] = "max-autotune"
@@ -403,6 +403,24 @@ def llama_attn_forward(self, hidden_states, attention_mask=None, position_ids=No
 # Patch the attention forward
 modeling_llama.LlamaAttention.forward = llama_attn_forward
 
+# Update the loss computation to use torch.compile
+@torch.compile(mode='reduce-overhead', backend='eager')
+def compute_loss_compiled(logits, labels, ignore_index=-100):
+    """Compiled loss computation function avoiding dynamic shapes"""
+    # Reshape if needed
+    logits = logits.view(-1, logits.size(-1))
+    labels = labels.view(-1)
+    
+    # Use cross_entropy with ignore_index
+    loss = F.cross_entropy(
+        logits,
+        labels,
+        reduction='mean',
+        ignore_index=ignore_index
+    )
+    
+    return loss
+
 class CustomTrainer(Trainer):
     """Custom trainer with dynamic shape optimization"""
     def __init__(self, *args, **kwargs):
@@ -419,30 +437,23 @@ class CustomTrainer(Trainer):
         return "math"
 
     def compute_loss(self, model, inputs, return_outputs=False):
-        """Compute loss with optimized attention"""
-        current_seq_length = inputs['input_ids'].size(1)
+        """Compute loss with compiled loss function"""
+        outputs = model(
+            input_ids=inputs['input_ids'],
+            attention_mask=inputs['attention_mask'],
+            labels=inputs['labels']
+        )
         
-        try:
-            # First attempt: Direct forward pass
-            outputs = model(
-                input_ids=inputs['input_ids'],
-                attention_mask=inputs['attention_mask'],
-                labels=inputs['labels']
-            )
-        except RuntimeError as e:
-            # If direct pass fails, try with math mode
-            if "No available kernel" in str(e):
-                # Use the older backend temporarily
-                with torch.backends.cuda.sdp_kernel(enable_math=True):
-                    outputs = model(
-                        input_ids=inputs['input_ids'],
-                        attention_mask=inputs['attention_mask'],
-                        labels=inputs['labels']
-                    )
-            else:
-                raise e
+        if hasattr(outputs, 'logits'):
+            with torch.backends.cudnn.flags(enabled=True, benchmark=True):
+                loss = compute_loss_compiled(
+                    outputs.logits,
+                    inputs['labels']
+                )
+        else:
+            loss = outputs.loss
 
-        return (outputs.loss, outputs) if return_outputs else outputs.loss
+        return (loss, outputs) if return_outputs else loss
 
     def _prepare_inputs(self, inputs):
         """Prepare inputs with proper device placement"""
