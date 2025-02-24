@@ -13,6 +13,7 @@ import types
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+from transformers import Trainer
 
 # ----------------------
 # Critical Configuration
@@ -360,116 +361,103 @@ def setup_compilation_environment():
     print("Running with strict static shape optimization")
     return "inductor"
 
-class CustomTrainer(SFTTrainer):
+# First, patch the MLP forward function directly
+def llama_mlp_forward(self, x):
+    return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+# Patch it directly into the transformers library
+import transformers.models.llama.modeling_llama as modeling_llama
+modeling_llama.LlamaMLP.forward = llama_mlp_forward
+
+# Add attention optimization
+def llama_attn_forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None, output_attentions=False, use_cache=False):
+    bsz, q_len, _ = hidden_states.size()
+
+    query_states = self.q_proj(hidden_states)
+    key_states = self.k_proj(hidden_states)
+    value_states = self.v_proj(hidden_states)
+
+    query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+    key_states = key_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+    value_states = value_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+    kv_seq_len = key_states.shape[-2]
+    if past_key_value is not None:
+        kv_seq_len += past_key_value[0].shape[-2]
+
+    # Use regular attention when flash attention is not available
+    attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
+    
+    if attention_mask is not None:
+        attn_weights = attn_weights + attention_mask
+    
+    attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
+    attn_output = torch.matmul(attn_weights, value_states)
+
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+    attn_output = self.o_proj(attn_output)
+
+    return attn_output, attn_weights, past_key_value
+
+# Patch the attention forward
+modeling_llama.LlamaAttention.forward = llama_attn_forward
+
+class CustomTrainer(Trainer):
+    """Custom trainer with static shape optimization"""
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         
-        # Cache static shapes and configs
-        self._setup_static_config(kwargs.get('model'))
+        # Get max sequence length from config
+        self.max_seq_length = self.args.max_seq_length
         
-        # Pre-compile with static shapes
-        self._setup_static_functions()
-    
-    def _setup_static_config(self, model):
-        """Setup static configuration to prevent recompilations"""
-        self._static_config = {
-            'batch_size': 1,
-            'seq_length': 2048,
-            'hidden_size': model.config.hidden_size,
-            'vocab_size': model.config.vocab_size,
-            'dtype': torch.float16
-        }
-        
-        # Create static buffers
-        device = torch.device('cuda')
+        # Initialize static buffers with correct sizes
+        batch_size = self.args.per_device_train_batch_size
         self._static_buffers = {
             'input_ids': torch.zeros(
-                (self._static_config['batch_size'], self._static_config['seq_length']),
-                dtype=torch.long, device=device
+                (batch_size, self.max_seq_length),
+                dtype=torch.long,
+                device=self.args.device
             ),
-            'attention_mask': torch.ones(
-                (self._static_config['batch_size'], self._static_config['seq_length']),
-                dtype=torch.long, device=device
+            'attention_mask': torch.zeros(
+                (batch_size, self.max_seq_length),
+                dtype=torch.long,
+                device=self.args.device
             ),
             'labels': torch.zeros(
-                (self._static_config['batch_size'], self._static_config['seq_length']),
-                dtype=torch.long, device=device
+                (batch_size, self.max_seq_length),
+                dtype=torch.long,
+                device=self.args.device
             )
         }
-    
-    def _setup_static_functions(self):
-        """Setup all compiled functions with strict static shapes"""
-        
-        def static_forward(model, input_ids, attention_mask):
-            """Forward pass with guaranteed static shapes"""
-            return model(
-                input_ids=input_ids[:, :self._static_config['seq_length']],
-                attention_mask=attention_mask[:, :self._static_config['seq_length']],
-                use_cache=False
-            )
-        
-        def static_loss(logits, labels):
-            """Loss computation with guaranteed static shapes"""
-            # Use static shapes
-            batch_size = self._static_config['batch_size']
-            seq_length = self._static_config['seq_length']
-            vocab_size = self._static_config['vocab_size']
-            
-            # Reshape with known static dimensions
-            flat_logits = logits.view(-1, vocab_size)
-            flat_labels = labels.view(-1)
-            
-            # Static masking
-            mask = (flat_labels != -100)
-            valid_logits = flat_logits[mask]
-            valid_labels = flat_labels[mask]
-            
-            return F.cross_entropy(
-                valid_logits,
-                valid_labels,
-                ignore_index=-100,
-                reduction='mean'
-            )
-        
-        # Compile with strict static shapes
-        self._compiled_fns = {
-            'forward': torch.compile(
-                static_forward,
-                backend="inductor",
-                mode="max-autotune",
-                fullgraph=True,
-                dynamic=False
-            ),
-            'loss': torch.compile(
-                static_loss,
-                backend="inductor",
-                mode="max-autotune",
-                fullgraph=True,
-                dynamic=False
-            )
-        }
-    
+
     def compute_loss(self, model, inputs, return_outputs=False):
         """Compute loss with static shapes"""
-        # Copy inputs to static buffers to maintain shapes
+        # Handle input padding/truncation
         for key in ['input_ids', 'attention_mask', 'labels']:
             if key in inputs:
+                current_size = inputs[key].size(1)
+                if current_size < self.max_seq_length:
+                    pad_size = self.max_seq_length - current_size
+                    pad = torch.zeros(
+                        (inputs[key].size(0), pad_size),
+                        dtype=inputs[key].dtype,
+                        device=inputs[key].device
+                    )
+                    inputs[key] = torch.cat([inputs[key], pad], dim=1)
+                elif current_size > self.max_seq_length:
+                    inputs[key] = inputs[key][:, :self.max_seq_length]
+                
                 self._static_buffers[key].copy_(inputs[key])
-        
+
         # Forward pass with static shapes
-        outputs = self._compiled_fns['forward'](
-            model,
-            self._static_buffers['input_ids'],
-            self._static_buffers['attention_mask']
+        outputs = model(
+            input_ids=self._static_buffers['input_ids'],
+            attention_mask=self._static_buffers['attention_mask'],
+            labels=self._static_buffers['labels']
         )
-        
-        # Compute loss with static shapes
-        loss = self._compiled_fns['loss'](
-            outputs.logits,
-            self._static_buffers['labels']
-        )
-        
-        return (loss, outputs) if return_outputs else loss
+
+        return (outputs.loss, outputs) if return_outputs else outputs.loss
 
 # ------------------
 # Training Setup
