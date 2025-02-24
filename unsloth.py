@@ -404,60 +404,53 @@ def llama_attn_forward(self, hidden_states, attention_mask=None, position_ids=No
 modeling_llama.LlamaAttention.forward = llama_attn_forward
 
 class CustomTrainer(Trainer):
-    """Custom trainer with static shape optimization"""
+    """Custom trainer with dynamic shape optimization"""
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        
-        # Get max sequence length from config
-        self.max_seq_length = self.args.max_seq_length
-        
-        # Initialize static buffers with correct sizes
-        batch_size = self.args.per_device_train_batch_size
-        self._static_buffers = {
-            'input_ids': torch.zeros(
-                (batch_size, self.max_seq_length),
-                dtype=torch.long,
-                device=self.args.device
-            ),
-            'attention_mask': torch.zeros(
-                (batch_size, self.max_seq_length),
-                dtype=torch.long,
-                device=self.args.device
-            ),
-            'labels': torch.zeros(
-                (batch_size, self.max_seq_length),
-                dtype=torch.long,
-                device=self.args.device
-            )
-        }
+        self.attention_mode = self._detect_attention_mode()
+
+    def _detect_attention_mode(self):
+        """Detect the best available attention implementation"""
+        device_cap = torch.cuda.get_device_capability()
+        if device_cap >= (8, 0):
+            return "scaled_dot_product"
+        elif device_cap >= (7, 5):
+            return "memory_efficient"
+        return "math"
 
     def compute_loss(self, model, inputs, return_outputs=False):
-        """Compute loss with static shapes"""
-        # Handle input padding/truncation
-        for key in ['input_ids', 'attention_mask', 'labels']:
-            if key in inputs:
-                current_size = inputs[key].size(1)
-                if current_size < self.max_seq_length:
-                    pad_size = self.max_seq_length - current_size
-                    pad = torch.zeros(
-                        (inputs[key].size(0), pad_size),
-                        dtype=inputs[key].dtype,
-                        device=inputs[key].device
+        """Compute loss with optimized attention"""
+        current_seq_length = inputs['input_ids'].size(1)
+        
+        try:
+            # First attempt: Direct forward pass
+            outputs = model(
+                input_ids=inputs['input_ids'],
+                attention_mask=inputs['attention_mask'],
+                labels=inputs['labels']
+            )
+        except RuntimeError as e:
+            # If direct pass fails, try with math mode
+            if "No available kernel" in str(e):
+                # Use the older backend temporarily
+                with torch.backends.cuda.sdp_kernel(enable_math=True):
+                    outputs = model(
+                        input_ids=inputs['input_ids'],
+                        attention_mask=inputs['attention_mask'],
+                        labels=inputs['labels']
                     )
-                    inputs[key] = torch.cat([inputs[key], pad], dim=1)
-                elif current_size > self.max_seq_length:
-                    inputs[key] = inputs[key][:, :self.max_seq_length]
-                
-                self._static_buffers[key].copy_(inputs[key])
-
-        # Forward pass with static shapes
-        outputs = model(
-            input_ids=self._static_buffers['input_ids'],
-            attention_mask=self._static_buffers['attention_mask'],
-            labels=self._static_buffers['labels']
-        )
+            else:
+                raise e
 
         return (outputs.loss, outputs) if return_outputs else outputs.loss
+
+    def _prepare_inputs(self, inputs):
+        """Prepare inputs with proper device placement"""
+        inputs = super()._prepare_inputs(inputs)
+        for k, v in inputs.items():
+            if isinstance(v, torch.Tensor):
+                inputs[k] = v.contiguous()
+        return inputs
 
 # ------------------
 # Training Setup
