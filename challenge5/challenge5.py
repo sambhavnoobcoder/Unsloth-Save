@@ -176,7 +176,7 @@ def validate_llama_training_loss_matches():
         
         # Set the HF token directly if not in environment
         import os
-        hf_token = os.environ.get("HF_TOKEN", "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")
+        hf_token = os.environ.get("HF_TOKEN", "your_hf_token_here")
         
         # Try to load a 1B model specifically
         try:
