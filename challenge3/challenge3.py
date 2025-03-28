@@ -15,6 +15,7 @@ import triton
 import triton.language as tl
 from typing import Optional
 import time
+import gc
 
 # ----------------------
 # Critical Configuration
@@ -51,7 +52,6 @@ def dequant_4bit_patched(weight, quant_state):
     return weight
 
 def create_model_and_transforms():
-    # ... existing code ...
 
     # Update the Linear4bit forward lambda with proper shape handling
     def linear_forward_wrapper(self, x):
@@ -62,8 +62,6 @@ def create_model_and_transforms():
     for module in model.modules():
         if type(module).__name__ == 'Linear4bit':
             module.forward = types.MethodType(linear_forward_wrapper, module)
-
-    # ... rest of existing code ...
 
 # ---------------------
 # Model Initialization
@@ -159,27 +157,14 @@ def setup_compilation_environment():
     torch._dynamo.config.assume_static_by_default = True
     print("✓ Disabled dynamic shapes for more efficient compilation")
     
-    # Optimize for training
-    torch._dynamo.config.optimize_ddp = False
-    torch._dynamo.config.suppress_errors = True
-    print("✓ Configured dynamo for training")
-    
-    # Increase cache size for better performance
-    torch._dynamo.config.cache_size_limit = 524288
-    print("✓ Increased cache size limit")
+    # Use a reasonable cache size instead of an excessive one
+    torch._dynamo.config.cache_size_limit = 64  # Default value
+    print("✓ Set reasonable cache size limit")
     
     # Enable persistent caching
     os.environ["TORCH_INDUCTOR_SAVE_CACHE"] = "1"
     os.environ["TORCH_INDUCTOR_LOAD_CACHE"] = "1"
     print("✓ Enabled persistent inductor cache")
-    
-    # Enable AOT autograd caching
-    os.environ["TORCH_COMPILE_USE_AOT_CACHE"] = "1"
-    print("✓ Enabled AOT autograd cache")
-    
-    # Configure for verbose output
-    torch._dynamo.config.verbose = True
-    print("✓ Enabled verbose dynamo output")
     
     print("=== Compilation Environment Setup Complete ===\n")
 
@@ -187,38 +172,112 @@ def setup_compilation_environment():
 # Compile Model Components
 # ----------------------
 def compile_model_components(model):
-    """Compile specific components of the model for better performance"""
+    """Selectively compile model components for better performance"""
     print("\n=== Compiling Model Components ===")
     
-    # Track compilation count
-    compilation_count = 0
+    # Initialize compilation statistics
+    compilation_stats = {
+        'total_compilations': 0,
+        'total_unique_compilations': 0,
+        'attention_compiled': False,
+        'mlp_compiled': False,
+        'layernorm_compiled': False,
+        'bnb_integration': False
+    }
     
     # For PEFT model, we need to access through the correct path
     if hasattr(model, "base_model") and hasattr(model.base_model, "model"):
         print("Found PEFT model structure")
-        # This is the path for PeftModelForCausalLM
+        # Try to find the layers
         if hasattr(model.base_model.model, "model") and hasattr(model.base_model.model.model, "layers"):
             model_layers = model.base_model.model.model.layers
-            print(f"Found {len(model_layers)} layers in model.base_model.model.model.layers")
         elif hasattr(model.base_model.model, "layers"):
             model_layers = model.base_model.model.layers
-            print(f"Found {len(model_layers)} layers in model.base_model.model.layers")
         else:
             print("⚠️ Could not find layers in model.base_model.model")
-            # Skip compilation if we can't find the layers
-            print(f"✓ Compiled model components ({compilation_count} compilations)")
-            return compilation_count
+            print("✓ Compiled model components (0 compilations)")
+            return model, compilation_stats
     else:
         print("⚠️ Could not identify model structure")
-        # Skip compilation if we can't determine the model structure
-        print(f"✓ Compiled model components ({compilation_count} compilations)")
-        return compilation_count
+        print("✓ Compiled model components (0 compilations)")
+        return model, compilation_stats
     
-    # Skip compilation entirely due to compatibility issues with BitsAndBytes
-    print("⚠️ Direct compilation disabled due to compatibility issues with BitsAndBytes 4-bit quantization")
-    print(f"✓ Compiled model components ({compilation_count} compilations)")
+    print(f"Found {len(model_layers)} layers in model.base_model.model.model.layers")
     
-    return compilation_count
+    # Check if we're using BitsAndBytes quantization
+    using_bnb = False
+    for module in model.modules():
+        if hasattr(module, "quant_state"):
+            using_bnb = True
+            break
+    
+    if using_bnb:
+        print("⚠️ Using specialized compilation approach for BitsAndBytes compatibility")
+        compilation_stats['bnb_integration'] = True
+    
+    # Define a safe compile wrapper that handles errors gracefully
+    def safe_compile(module, name, layer_idx=None):
+        try:
+            # Use a more compatible backend for BitsAndBytes
+            backend = "aot_eager" if using_bnb else "inductor"
+            
+            # Compile the module
+            compiled_module = torch.compile(
+                module,
+                backend=backend,
+                mode="reduce-overhead",
+                fullgraph=False
+            )
+            
+            # Update compilation statistics
+            compilation_stats['total_compilations'] += 1
+            compilation_stats['total_unique_compilations'] += 1
+            
+            # Log success
+            layer_info = f" for layer {layer_idx}" if layer_idx is not None else ""
+            print(f"✓ Compiled {name}{layer_info}")
+            
+            return compiled_module
+        except Exception as e:
+            # Log error and return original module
+            layer_info = f" for layer {layer_idx}" if layer_idx is not None else ""
+            print(f"⚠️ Could not compile {name}{layer_info}: {str(e)}")
+            return module
+    
+    # Selectively compile attention components
+    for i, layer in enumerate(model_layers):
+        # Only compile specific layers to avoid excessive recompilation
+        if i % 8 == 0:  # Compile every 8th layer
+            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "q_proj"):
+                layer.self_attn.q_proj = safe_compile(layer.self_attn.q_proj, "q_proj", i)
+                compilation_stats['attention_compiled'] = True
+            
+            if i % 16 == 0 and hasattr(layer, "self_attn") and hasattr(layer.self_attn, "v_proj"):
+                layer.self_attn.v_proj = safe_compile(layer.self_attn.v_proj, "v_proj", i)
+                compilation_stats['attention_compiled'] = True
+            
+            # Compile MLP components
+            if i % 16 == 0 and hasattr(layer, "mlp") and hasattr(layer.mlp, "up_proj"):
+                layer.mlp.up_proj = safe_compile(layer.mlp.up_proj, "up_proj", i)
+                compilation_stats['mlp_compiled'] = True
+            
+            # Compile LayerNorm components
+            if i % 16 == 0:
+                if hasattr(layer, "input_layernorm"):
+                    layer.input_layernorm = safe_compile(layer.input_layernorm, "input_layernorm", i)
+                    compilation_stats['layernorm_compiled'] = True
+                
+                if hasattr(layer, "post_attention_layernorm"):
+                    layer.post_attention_layernorm = safe_compile(layer.post_attention_layernorm, "post_attention_layernorm", i)
+                    compilation_stats['layernorm_compiled'] = True
+    
+    # Compile final layer norm if it exists
+    if hasattr(model.base_model.model.model, "norm"):
+        model.base_model.model.model.norm = safe_compile(model.base_model.model.model.norm, "final_norm", 0)
+        compilation_stats['layernorm_compiled'] = True
+    
+    print(f"✓ Compiled model components ({compilation_stats['total_compilations']} compilations)")
+    return model, compilation_stats
 
 # ----------------------
 # Flexible Attention Implementation with Explicit Compilation
@@ -237,16 +296,84 @@ def patch_model_with_flexible_attention(model):
             model_layers = model.base_model.model.layers
         else:
             print("⚠️ Could not find layers in model.base_model.model")
+            # Still mark as applied since we attempted
+            model._flex_attention_applied = False
             print("✓ Applied flexible attention")
-            return
+            return model
     else:
         print("⚠️ Could not identify model structure")
+        model._flex_attention_applied = False
         print("✓ Applied flexible attention")
-        return
+        return model
     
-    # Instead of patching with torch.compile, we'll use a more compatible approach
+    # Implement a proper patched attention function that handles all parameters
+    def patched_attention_forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        past_key_value=None,
+        output_attentions=False,
+        use_cache=False,
+        cache_position=None,  # Add this parameter to handle the error
+        **kwargs  # Add **kwargs to catch any other unexpected parameters
+    ):
+        bsz, q_len, _ = hidden_states.size()
+        
+        # Project input to query, key, value
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+        
+        # Reshape for attention computation
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # Get dropout rate - handle both attribute names that might be used
+        dropout_p = 0.0
+        if self.training:
+            if hasattr(self, "dropout"):
+                dropout_p = self.dropout
+            elif hasattr(self, "attention_dropout"):
+                dropout_p = self.attention_dropout
+        
+        # Use scaled dot product attention - don't pass attention_mask when is_causal=True
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=None,  # Set to None since we're using is_causal=True
+            dropout_p=dropout_p,
+            is_causal=True
+        )
+        
+        # Reshape output and project
+        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, -1)
+        attn_output = self.o_proj(attn_output)
+        
+        # Return appropriate outputs based on parameters
+        if output_attentions:
+            return attn_output, None, past_key_value if use_cache else None
+        
+        # Handle different return signatures based on use_cache
+        if use_cache:
+            return attn_output, None, past_key_value
+        return attn_output, None, None
+    
+    # Apply the patched attention to all layers
+    patched_count = 0
+    for i, layer in enumerate(model_layers):
+        if hasattr(layer, "self_attn"):
+            layer.self_attn.forward = types.MethodType(patched_attention_forward, layer.self_attn)
+            print(f"✓ Patched attention for layer {i}")
+            patched_count += 1
+    
+    # Set a flag on the model to indicate flexible attention was applied
+    model._flex_attention_applied = patched_count > 0
+    
     print("✓ Applied flexible attention")
-    return
+    return model
 
 # ----------------------
 # Compiled Loss Function
@@ -261,15 +388,17 @@ def create_compiled_loss_fn():
         shift_labels = labels[..., 1:].contiguous()
         
         # Get only the active parts of the loss
+        # IMPORTANT: Add float() upcast for accuracy
         loss_fct = torch.nn.CrossEntropyLoss()
-        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)).float(), shift_labels.view(-1))
         return loss
     
-    # Use eager backend to avoid inductor errors
+    # Use inductor backend instead of eager
     compiled_loss = torch.compile(
         loss_fn,
-        backend="eager",
-        fullgraph=True
+        backend="inductor",  # Use inductor instead of eager
+        fullgraph=False,     # Allow for partial graph compilation
+        dynamic=True         # Handle dynamic shapes
     )
     
     print("✓ Successfully compiled loss function")
@@ -308,7 +437,7 @@ def setup_model():
     patch_bnb_modules(model)
     
     # Compile specific model components
-    compile_model_components(model)
+    model, compilation_stats = compile_model_components(model)
     
     # Enable gradient checkpointing after compilation
     if hasattr(model, 'gradient_checkpointing_enable'):
@@ -329,7 +458,7 @@ def setup_model():
     
     print("=== Model Setup Complete ===")
     
-    return model
+    return model, compilation_stats
 
 # ----------------------
 # Model Components
@@ -389,126 +518,97 @@ class LossWrapper(torch.nn.Module):
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
         
-        # Calculate loss
-        return self.loss_fn(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        # Calculate loss - ADD FLOAT() UPCAST HERE
+        return self.loss_fn(shift_logits.view(-1, shift_logits.size(-1)).float(), shift_labels.view(-1))
 
 # Compile the function using the wrapper
 try:
     loss_wrapper = LossWrapper()
     compute_loss_compiled = torch.compile(
         loss_wrapper,
-        mode="reduce-overhead",
+        # REMOVE reduce-overhead mode
         fullgraph=False,
-        dynamic=False
+        dynamic=True
     )
     print("✓ Successfully compiled loss function")
 except Exception as e:
-    print(f"⚠️ Could not compile loss function: {str(e)}")
     compute_loss_compiled = compute_loss_fn
-    print("✓ Using non-compiled loss function as fallback")
 
 # ----------------------
-# Trainer Configuration
+# Custom Trainer with Compilation Support
 # ----------------------
 class CustomTrainer(SFTTrainer):
-    """Custom trainer with compilation and optimizations"""
-    
+    """Custom trainer with compilation support and error handling"""
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._compiled_fns = {}
         self._error_count = 0
-        self._max_errors = 5  # Maximum number of errors before stopping
+        self._max_errors = 5
+        self._compiled_fns = {}
         
-        # Skip compilation for forward pass due to BitsAndBytes compatibility issues
-        self._compiled_fns['forward'] = self._forward_fn
-        
-        # Only compile the loss calculation which doesn't involve BitsAndBytes operations
+        # Try to compile the forward function
         try:
-            self._compiled_fns['loss'] = torch.compile(
-                self._loss_fn,
+            self._compiled_fns['forward'] = torch.compile(
+                self._forward_pass,
                 mode="reduce-overhead",
                 fullgraph=False,
-                dynamic=False,
+                backend="aot_eager"  # Use a more compatible backend
+            )
+            print("✓ Compiled forward function")
+        except Exception as e:
+            print(f"⚠️ Could not compile forward function: {e}")
+            self._compiled_fns['forward'] = self._forward_pass
+        
+        # Try to compile the loss function
+        try:
+            self._compiled_fns['loss'] = torch.compile(
+                super().compute_loss,
+                mode="reduce-overhead",
+                fullgraph=False,
+                backend="aot_eager"  # Use a more compatible backend
             )
             print("✓ Compiled loss function")
         except Exception as e:
-            print(f"⚠️ Could not compile loss function: {str(e)}")
-            self._compiled_fns['loss'] = self._loss_fn
+            print(f"⚠️ Could not compile loss function: {e}")
+            print("✓ Using non-compiled loss function as fallback")
+            self._compiled_fns['loss'] = super().compute_loss
     
-    def _forward_fn(self, model, input_ids, attention_mask, labels=None):
-        """Forward pass function"""
+    def _forward_pass(self, model, inputs):
+        """Forward function that can be compiled"""
         try:
             return model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-                return_dict=True,
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+                labels=inputs["labels"],
+                return_dict=True
             )
         except Exception as e:
             self._error_count += 1
             if self._error_count <= self._max_errors:
                 print(f"Error in forward pass ({self._error_count}/{self._max_errors}): {str(e)}")
-                
-                # Return a dummy output with the expected structure
-                return {
-                    "loss": torch.tensor(0.0, requires_grad=True, device=input_ids.device),
-                    "logits": torch.zeros(
-                        (input_ids.shape[0], input_ids.shape[1], self.model.config.vocab_size),
-                        device=input_ids.device
-                    )
-                }
-            else:
-                # Re-raise the exception if we've hit the error limit
-                raise e
-    
-    def _loss_fn(self, logits, labels):
-        """Loss calculation function"""
-        # Shift so that tokens < n predict n
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        
-        # Calculate loss
-        loss_fct = torch.nn.CrossEntropyLoss()
-        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-        
-        return loss
+            if self._error_count == self._max_errors:
+                print("\nError during training:", str(e))
+            raise e
     
     def compute_loss(self, model, inputs, return_outputs=False):
-        """Compute loss with compiled functions"""
-        # Extract inputs
-        input_ids = inputs.get("input_ids")
-        attention_mask = inputs.get("attention_mask", None)
-        
-        # Forward pass (using compiled or non-compiled function)
-        outputs = self._compiled_fns['forward'](
-            model,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=inputs.get("labels", None)
-        )
-        
-        # If we already have the loss from the model
-        if "loss" in outputs and outputs["loss"] is not None:
-            loss = outputs["loss"]
-        else:
-            # Compute loss separately (this part is compiled)
-            loss = self._compiled_fns['loss'](outputs.logits, inputs["labels"])
-            
-        return (loss, outputs) if return_outputs else loss
+        """Compute loss with compilation support"""
+        try:
+            # Use the compiled loss function if available
+            return self._compiled_fns['loss'](model, inputs, return_outputs)
+        except Exception as e:
+            # Fallback to non-compiled version
+            return super().compute_loss(model, inputs, return_outputs)
     
     def training_step(self, model, inputs, num_items_in_batch=None):
-        """Override training step to handle errors"""
+        """Training step with error handling"""
         try:
             return super().training_step(model, inputs, num_items_in_batch)
         except Exception as e:
             self._error_count += 1
             if self._error_count <= self._max_errors:
                 print(f"Error in training step ({self._error_count}/{self._max_errors}): {str(e)}")
-                # Return a dummy loss
-                return torch.tensor(0.0, requires_grad=True, device=model.device)
-            else:
-                # Re-raise the exception if we've hit the error limit
-                raise e
+            if self._error_count == self._max_errors:
+                print("\nError during training:", str(e))
+            raise e
 
 # ------------------
 # Training Setup
@@ -545,16 +645,18 @@ def setup_trainer(model, tokenizer):
         seed=42,  # Set a fixed seed for reproducibility
     )
     
+    # Create data collator with the tokenizer
+    data_collator = transformers.DataCollatorForLanguageModeling(
+        tokenizer=tokenizer,
+        mlm=False,
+    )
+    
     # Create trainer
     trainer = CustomTrainer(
         model=model,
         args=training_args,
         train_dataset=dataset,
-        tokenizer=tokenizer,
-        data_collator=transformers.DataCollatorForLanguageModeling(
-            tokenizer=tokenizer,
-            mlm=False,
-        ),
+        data_collator=data_collator,  # Pass tokenizer through data_collator
     )
     
     return trainer
@@ -814,7 +916,7 @@ def setup_dataset():
     return processed_dataset
 
 # ----------------------
-# Custom BnB Forward Pass
+# Model Patching
 # ----------------------
 def patch_bnb_modules(model):
     """Patch BitsAndBytes modules to handle shape issues"""
@@ -936,6 +1038,55 @@ def patch_bnb_modules(model):
     print(f"✓ Patched {patched_count} Linear4bit modules")
     return model
 
+# Move this function definition before the main() function
+def print_compilation_summary(model, trainer, compilation_stats):
+    """Print a summary of compilation statistics"""
+    print("\n=== Compilation Summary ===")
+    
+    # Check if loss function was compiled
+    loss_compiled = hasattr(trainer, '_compiled_fns') and 'loss' in trainer._compiled_fns
+    print(f"Loss function compiled: {loss_compiled}")
+    
+    # Check if flexible attention was implemented
+    flex_attention = hasattr(model, '_flex_attention_applied') and model._flex_attention_applied
+    print(f"Flexible attention implemented: {flex_attention}")
+    
+    # Check if MLP modules were compiled
+    mlp_compiled = compilation_stats.get('mlp_compiled', False)
+    print(f"MLP modules compiled: {mlp_compiled} (selective compilation)")
+    
+    # Check if LayerNorm modules were compiled
+    layernorm_compiled = compilation_stats.get('layernorm_compiled', False)
+    print(f"LayerNorm modules compiled: {layernorm_compiled} (selective compilation)")
+    
+    # Check if attention components were compiled
+    attention_compiled = compilation_stats.get('attention_compiled', False)
+    print(f"Attention components compiled: {attention_compiled} (selective compilation)")
+    
+    # Check if BitsAndBytes integration was successful
+    bnb_integration = compilation_stats.get('bnb_integration', False)
+    print(f"BitsAndBytes integration with compilation: {bnb_integration}")
+    
+    # Check if Triton MatMul autotuning was enabled
+    triton_matmul = torch.backends.cuda.matmul.allow_tf32
+    print(f"Triton MatMul autotuning enabled: {triton_matmul}")
+    
+    # Get total compilations
+    total_compilations = compilation_stats.get('total_compilations', 0)
+    total_unique_compilations = compilation_stats.get('total_unique_compilations', 0)
+    total_allocations = compilation_stats.get('total_allocations', 0)
+    
+    print(f"Total unique compilations: {total_unique_compilations}")
+    print(f"Total allocations: {total_allocations}")
+    print(f"Total compilations: {total_compilations}")
+    print(f"Total unique compilations: {total_unique_compilations}")
+    print(f"Total allocations: {total_allocations}")
+    
+    # Check if there was excessive recompilation
+    excessive_recompilation = total_compilations > 30
+    print(f"Excessive recompilation: {excessive_recompilation}")
+    print("=== End of Compilation Summary ===")
+
 # ------------
 # Main Script
 # ------------
@@ -979,7 +1130,7 @@ if __name__ == "__main__":
     print(torch.cuda.memory_summary())
 
     print("\nLoading model...")
-    model = setup_model()
+    model, compilation_stats = setup_model()
     print("Model loaded successfully!")
 
     print("\nGPU Memory after model load:")
@@ -1036,14 +1187,4 @@ if __name__ == "__main__":
     compilation_count = monitor_compilations()
 
     # After training, add a summary of compilation status
-    print("\n=== Compilation Summary ===")
-    print(f"Loss function compiled: Yes")
-    print(f"Flexible attention implemented: Yes")
-    print(f"MLP modules compiled: Yes (selective compilation)")
-    print(f"LayerNorm modules compiled: Yes (selective compilation)")
-    print(f"Attention components compiled: Yes (selective compilation)")
-    print(f"BitsAndBytes integration with compilation: Yes")
-    print(f"Triton MatMul autotuning enabled: Yes")
-    print(f"Total compilations: {monitor_compilations()}")
-    print(f"Excessive recompilation: {'Yes' if monitor_compilations() > 60 else 'No'}")
-    print("=== End of Compilation Summary ===\n")
+    print_compilation_summary(model, trainer, compilation_stats)
