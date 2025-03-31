@@ -32,7 +32,12 @@ def transformation_function_focal(batch, weight, labels, gamma=1.0, eps=1e-7):
       - weight: (vocab, D)
       - labels: (B, S) or (B*S,) for classification.
     """
+    # Perform the linear operation in original precision (bfloat16)
     x = F.linear(batch, weight)
+    
+    # Upcast to float32 for numerical stability in the loss computation
+    x = x.float()
+    
     log_p = F.log_softmax(x, dim=-1)
     p = log_p.exp()
     target = labels.view(-1).long()
@@ -146,12 +151,16 @@ class MemoryEfficientLinear(torch.autograd.Function):
 
 def reference_loss_fn_CE(X, W, labels):
     logits = F.linear(X, W)
+    # Upcast to float32 for numerical stability in the loss computation
+    logits = logits.float()
     B, S, _ = X.shape
     loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1), reduction="sum")
     return loss / (B * S)
 
 def reference_loss_fn_focal(X, W, labels, gamma=1.0, eps=1e-7):
     logits = F.linear(X, W)
+    # Upcast to float32 for numerical stability in the loss computation
+    logits = logits.float()
     log_p = F.log_softmax(logits, dim=-1)
     p = log_p.exp()
     target = labels.view(-1).long()
